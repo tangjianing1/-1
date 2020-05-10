@@ -137,8 +137,8 @@ vocab_size = len(tokenizer.word_index) + 1
 num_steps = len(img_name_train) // BATCH_SIZE
 #从InceptionV3中提取的向量的形状是(64，2048)
 #这两个变量代表了
-features_shape = 2048
-attention_features_shape = 64
+features_shape = 512
+attention_features_shape = 49
 
 # loading the numpy files
 def map_func(img_name, cap):
