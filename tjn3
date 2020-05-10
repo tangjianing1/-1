@@ -1,0 +1,492 @@
+from __future__ import absolute_import, division, print_function, unicode_literals
+
+import tensorflow as tf
+
+# We'll generate plots of attention in order to see which parts of an image
+# our model focuses on during captioning
+import matplotlib.pyplot as plt
+
+# Scikit-learn includes many helpful utilities
+from sklearn.model_selection import train_test_split
+from sklearn.utils import shuffle
+
+import re
+import numpy as np
+import os
+import time
+import json
+from glob import glob
+from PIL import Image
+import pickle
+from Bleu import my_bleu_v2
+
+annotation_file = './DPC-Captions-master/color_lighting.json'
+name_of_zip = './phnon/color_lighting.zip'
+PATH = './phnon/color_lighting/'
+# read the json file
+with open(annotation_file, 'r') as f:
+    annotations = json.load(f)
+
+# storing the captions and the image name in vectors
+all_captions = []
+all_img_name_vector = []
+
+for annot in annotations['annotations']:
+    caption = '<start> ' + annot['caption'] + ' <end>'
+    image_id = annot['image_id']
+    full_coco_image_path = PATH + 'image' + '%012d.jpg' % (image_id)
+
+    all_img_name_vector.append(full_coco_image_path)
+    all_captions.append(caption)
+
+file_name_img_name = 'all_imag_name_vextor'
+file_captions = 'all_captions.append'
+img_file = open(file_name_img_name, 'w')
+captions_file = open(file_captions, 'w')
+img_file.writelines(all_img_name_vector)
+captions_file.writelines(all_captions)
+img_file.close()
+captions_file.close()
+
+# shuffling the captions and image_names together
+# setting a random state
+train_captions, img_name_vector = shuffle(all_captions,
+                                          all_img_name_vector,
+                                          random_state=1)
+
+# selecting the first 30000 captions from the shuffled set
+num_examples = 3000
+train_captions = train_captions[:num_examples]
+img_name_vector = img_name_vector[:num_examples]
+
+def load_image(image_path):
+    img = tf.io.read_file(image_path)
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = tf.image.resize(img, (224, 224))
+    img = np.expand_dims(img, axis=0)
+    img = tf.keras.applications.vgg16.preprocess_input(img)
+    return img, image_path
+
+image_model = tf.keras.applications.vgg16.VGG16(include_top=False, weights='imagenet')
+#通过网络转发每个图像并将结果向量存储在字典中(image_name –> feature_vector)
+#在所有图像通过网络传递之后，您挑选字典并将其保存到磁盘。
+new_input = image_model.input
+hidden_layer = image_model.layers[-1].output
+
+image_features_extract_model = tf.keras.Model(new_input, hidden_layer)
+
+# getting the unique images
+encode_train = sorted(set(img_name_vector))
+
+# 可以根据系统配置随意更改batch_size
+#encode_train 是包含所有需要训练的图片id集合, 这行代码执行完之后, 在dataset里面的每一个元素都是一个tensor, 每个tensor的值是图片id.
+image_dataset = tf.data.Dataset.from_tensor_slices(encode_train)
+#对dataset里面的没一个数据进行预处理, 根据项目的需求, 进行map操作
+#tf.data.experimental.AUTOTUNE可以让程序自动的选择最优的线程并行个数
+image_dataset = image_dataset.map(load_image, num_parallel_calls=tf.data.experimental.AUTOTUNE).batch(16)
+
+for img, path in image_dataset:
+  batch_features = image_features_extract_model(img)
+  batch_features = tf.reshape(batch_features,
+                              (batch_features.shape[0], -1, batch_features.shape[3]))
+
+  for bf, p in zip(batch_features, path):
+    path_of_feature = p.numpy().decode("utf-8")
+    np.save(path_of_feature, bf.numpy())
+
+def calc_max_length(tensor):
+    return max(len(t) for t in tensor)
+
+#以上步骤是处理文本处理的一般过程
+
+#从词汇表中选择前5000个单词
+top_k = 5000
+#text.Tokenizer这个类用来对文本中的词进行统计计数，生成文档词典，以支持基于词典位序生成文本的向量表示
+#分词器Tokenizer语法
+tokenizer = tf.keras.preprocessing.text.Tokenizer(num_words=top_k,
+                                                  oov_token="<unk>",
+                                                  filters='!"#$%&()*+.,-/:;=?@[\]^_`{|}~ ')
+tokenizer.fit_on_texts(train_captions)
+train_seqs = tokenizer.texts_to_sequences(train_captions)
+
+tokenizer.word_index['<pad>'] = 0
+tokenizer.index_word[0] = '<pad>'
+# creating the tokenized vectors
+train_seqs = tokenizer.texts_to_sequences(train_captions)
+# 将每个向量填充到标题的最大长度
+# #如果未提供最大长度参数，pad_sequences会自动计算该参数
+cap_vector = tf.keras.preprocessing.sequence.pad_sequences(train_seqs, padding='post')
+# 计算最大长度
+# #用于存储注意力权重
+max_length = calc_max_length(train_seqs)
+
+#使用80-20分割创建培训和验证集
+img_name_train, img_name_val, cap_train, cap_val = train_test_split(img_name_vector,
+                                                                    cap_vector,
+                                                                    test_size=0.2,
+                                                                    random_state=0)
+
+# feel free to change these parameters according to your system's configuration
+#我们的图片和标题已准备就绪！接下来，让我们创建一个tf.data数据集来用于训练我们的模型。
+
+BATCH_SIZE = 64#批量= 64
+BUFFER_SIZE = 1000#缓冲器大小= 1000
+embedding_dim = 256#嵌入式dim = 256
+units = 512
+vocab_size = len(tokenizer.word_index) + 1
+num_steps = len(img_name_train) // BATCH_SIZE
+#从InceptionV3中提取的向量的形状是(64，2048)
+#这两个变量代表了
+features_shape = 2048
+attention_features_shape = 64
+
+# loading the numpy files
+def map_func(img_name, cap):
+  img_tensor = np.load(img_name.decode('utf-8')+'.npy')
+  return img_tensor, cap
+#from_tensor_slices，从张量的切片读取数据。张量自动切片
+dataset = tf.data.Dataset.from_tensor_slices((img_name_train, cap_train))
+
+# using map to load the numpy files in parallel
+#map此转换将map_func应用于此数据集的每个元素，并返回一个包含转换元素的新数据集，其顺序与输入中出现的顺序相同。
+dataset = dataset.map(lambda item1, item2: tf.numpy_function(
+          map_func, [item1, item2], [tf.float32, tf.int32]),
+          num_parallel_calls=tf.data.experimental.AUTOTUNE)
+
+# shuffling and batching
+dataset = dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+#buffer_size: 一个tf.int64标量tf.Tensor，代表着来自dataset的元素的数量，从中新的dataset将被sample。
+dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+#buffer_size: 一个tf.int64标量tf.Tensor，代表将被加入缓冲器的元素的最大数。
+#输入经过编码器模型，编码器模型为我们提供形状为 (批大小，最大长度，隐藏层大小) 的编码器输出和形状为 (批大小，隐藏层大小) 的编码器隐藏层状态。
+
+#FC = 完全连接（密集）层
+#EO = 编码器输出
+#H = 隐藏层状态
+#X = 解码器输入
+#伪代码：
+#score = FC(tanh(FC(EO) + FC(H)))
+#attention weights = softmax(score, axis = 1)。
+# Softmax 默认被应用于最后一个轴，但是这里我们想将它应用于第一个轴, 因为分数 （score） 的形状是 (批大小，最大长度，隐藏层大小)。
+# 最大长度 （max_length） 是我们的输入的长度。因为我们想为每个输入分配一个权重，所以 softmax 应该用在这个轴上。
+#context vector = sum(attention weights * EO, axis = 1)。选择第一个轴的原因同上。
+#embedding output = 解码器输入 X 通过一个嵌入层。
+#merged vector = concat(embedding output, context vector)
+#此合并后的向量随后被传送到 GRU
+
+
+class BahdanauAttention(tf.keras.Model):
+  def __init__(self, units):
+    super(BahdanauAttention, self).__init__()
+    self.W1 = tf.keras.layers.Dense(units)
+    self.W2 = tf.keras.layers.Dense(units)
+    self.V = tf.keras.layers.Dense(1)
+    #Dense 全连接层，整合所有特征到1xn的矩阵中，模糊了位置信息，只看特征
+  def call(self, features, hidden):
+    # features(CNN_encoder output) shape == (batch_size, 64, embedding_dim)
+
+    # hidden shape == (batch_size, hidden_size)
+    # hidden_with_time_axis shape == (batch_size, 1, hidden_size)
+    hidden_with_time_axis = tf.expand_dims(hidden, 1)
+
+    #tf.expand_dims(input,position,name)
+
+    #其中input就是要扩展的变量，position就是选择在那个位置上扩展维度，如果input原来是3维的
+    # 那么position有四个数字（0，1，2，3）可以选择可以理解为插空位扩展
+
+    # score shape == (batch_size, 64, hidden_size)
+    # 分数的形状 == （批大小，最大长度，1）
+    # 我们在最后一个轴上得到 1， 因为我们把分数应用于 self.V
+    # 在应用 self.V 之前，张量的形状是（批大小，最大长度，单位）
+    score = tf.nn.tanh(self.W1(features) + self.W2(hidden_with_time_axis))
+
+    # attention_weights shape == (batch_size, 64, 1)
+    # we get 1 at the last axis because we are applying score to self.V
+    # 注意力权重 （attention_weights） 的形状 == （批大小，最大长度，1）
+    attention_weights = tf.nn.softmax(self.V(score), axis=1)
+
+
+    # tf.nn.softmax返回：一个Tensor，与logits具有相同的类型和shape
+    #
+    # 通过Softmax回归，将logistic的预测二分类的概率的问题推广到了n分类的概率的问题。
+    #
+    # softmax的输出向量是概率，该样本属于各个类的概率。输出的向量的每个值的大小范围为0到1。
+    # 当一个样本经过softmax层并输出一个向量，会取这个向量中值最大的那个数的index作为这个样本的预测标签
+    # 上下文向量 （context_vector） 求和之后的形状 == （批大小，隐藏层大小）
+    context_vector = attention_weights * features
+    context_vector = tf.reduce_sum(context_vector, axis=1)
+
+    return context_vector, attention_weights
+
+class CNN_Encoder(tf.keras.Model):
+    # 因为我们已经提取了特征，并使用pickle将其丢弃
+    # #该编码器通过完全连接的层传递这些特征
+    def __init__(self, embedding_dim):
+        super(CNN_Encoder, self).__init__()
+        # shape after fc == (batch_size, 64, embedding_dim)
+        self.fc = tf.keras.layers.Dense(embedding_dim)
+    #dense全连接层
+    def call(self, x):
+        x = self.fc(x)
+        x = tf.nn.relu(x)
+        return x
+
+class RNN_Decoder(tf.keras.Model):
+  def __init__(self, embedding_dim, units, vocab_size):
+    super(RNN_Decoder, self).__init__()
+    self.units = units
+
+    self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+    ##vocab_size:字典大小
+    #embedding_dim:本层的输出大小，也就是生成的embedding的维数
+    #input_length:输入数据的维数，因为输入数据会做padding处理，所以一般是定义的max_length
+    self.gru = tf.keras.layers.GRU(self.units,
+                                   return_sequences=True,
+                                   return_state=True,
+                                   recurrent_initializer='glorot_uniform')
+    self.fc1 = tf.keras.layers.Dense(self.units)
+    self.fc2 = tf.keras.layers.Dense(vocab_size)
+    #用于注意力
+    self.attention = BahdanauAttention(self.units)
+
+  def call(self, x, features, hidden):
+    # 将注意力定义为一个独立的模型
+    context_vector, attention_weights = self.attention(features, hidden)
+
+    # 通过嵌入后的x形状==(批量，1，嵌入尺寸)
+    x = self.embedding(x)
+
+    # 连接后的x形状== (batc大小，1，嵌入dim +隐藏大小)
+    x = tf.concat([tf.expand_dims(context_vector, 1), x], axis=-1)
+
+    # passing the concatenated vector to the GRU
+    output, state = self.gru(x)
+
+    # shape == (batch_size, max_length, hidden_size)
+    x = self.fc1(output)
+
+    # x shape == (batch_size * max_length, hidden_size)
+    x = tf.reshape(x, (-1, x.shape[2]))
+
+    # output shape == (batch_size * max_length, vocab)
+    x = self.fc2(x)
+
+    return x, state, attention_weights
+
+  def reset_state(self, batch_size):
+    return tf.zeros((batch_size, self.units))
+
+encoder = CNN_Encoder(embedding_dim)
+decoder = RNN_Decoder(embedding_dim, units, vocab_size)
+
+#定义优化器和损失函数
+optimizer = tf.keras.optimizers.Adam()
+loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+    from_logits=True, reduction='none')
+
+#损失函数，比较真实值real和预测值pred，求差的和或者平均值
+
+def loss_function(real, pred):
+  mask = tf.math.logical_not(tf.math.equal(real, 0))
+  loss_ = loss_object(real, pred)
+
+  mask = tf.cast(mask, dtype=loss_.dtype)
+  loss_ *= mask
+
+  return tf.reduce_mean(loss_)
+
+#检查点（基于对象保存）
+#Checkpoint只用于保存模型的参数，不保存模型的计算过程
+checkpoint_path = "./checkpoints/train"
+ckpt = tf.train.Checkpoint(encoder=encoder,
+                           decoder=decoder,
+                           optimizer = optimizer)
+ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
+
+start_epoch = 0
+if ckpt_manager.latest_checkpoint:
+  start_epoch = int(ckpt_manager.latest_checkpoint.split('-')[-1])
+
+# adding this in a separate cell because if you run the training cell
+# many times, the loss_plot array will be reset
+loss_plot = []
+
+#将输入传送至编码器，编码器返回编码器输出和编码器隐藏层状态。
+#将编码器输出、编码器隐藏层状态和解码器输入（即开始标记）传送至解码器。
+#解码器返回预测和解码器隐藏层状态。
+#解码器隐藏层状态被传送回模型，预测被用于计算损失。
+#使用教师强制（teacher forcing）决定解码器的下一个输入。
+#教师强制是将目标词作为下一个输入 传送至解码器的技术。
+#最后一步是计算梯度，并将其应用于优化器和反向传播。
+@tf.function
+def train_step(img_tensor, target):
+  loss = 0
+
+  # 初始化每个批次的隐藏状态
+  # #因为图片之间的标题不相关
+  hidden = decoder.reset_state(batch_size=target.shape[0])
+
+  dec_input = tf.expand_dims([tokenizer.word_index['<start>']] * BATCH_SIZE, 1)
+
+  with tf.GradientTape() as tape:
+      features = encoder(img_tensor)
+
+    ## 教师强制 - 将目标词作为下一个输入
+      for i in range(1, target.shape[1]):
+          # passing the features through the decoder
+          ## 将编码器输出 （enc_output） 传送至解码器
+          predictions, hidden, _ = decoder(dec_input, features, hidden)
+
+          loss += loss_function(target[:, i], predictions)
+
+          # # 使用教师强制
+          dec_input = tf.expand_dims(target[:, i], 1)
+
+  total_loss = (loss / int(target.shape[1]))
+
+  trainable_variables = encoder.trainable_variables + decoder.trainable_variables
+
+  gradients = tape.gradient(loss, trainable_variables)
+  #tape.gradient计算梯度
+
+  optimizer.apply_gradients(zip(gradients, trainable_variables))
+
+  return loss, total_loss
+
+EPOCHS = 20
+
+for epoch in range(start_epoch, EPOCHS):
+    start = time.time()
+    total_loss = 0
+
+    for (batch, (img_tensor, target)) in enumerate(dataset):
+        batch_loss, t_loss = train_step(img_tensor, target)
+        total_loss += t_loss
+
+        if batch % 100 == 0:
+            print ('Epoch {} Batch {} Loss {:.4f}'.format(
+              epoch + 1, batch, batch_loss.numpy() / int(target.shape[1])))
+    # storing the epoch end loss value to plot later
+    loss_plot.append(total_loss / num_steps)
+    ## 每 5个周期（epoch），保存（检查点）一次模型
+    if epoch % 5 == 0:
+      ckpt_manager.save()
+
+    print ('Epoch {} Loss {:.6f}'.format(epoch + 1,
+                                         total_loss/num_steps))
+    print ('Time taken for 1 epoch {} sec\n'.format(time.time() - start))
+
+plt.plot(loss_plot)
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Loss Plot')
+plt.show()
+
+#翻译
+#评估函数类似于训练循环，不同之处在于在这里我们不使用 教师强制。每个时间步的解码器输入是其先前的预测、隐藏层状态和编码器输出。
+#当模型预测 结束标记 时停止预测。
+#存储 每个时间步的注意力权重。
+#请注意：对于一个输入，编码器输出仅计算一次
+def evaluate(image):
+    attention_plot = np.zeros((max_length, attention_features_shape))
+
+    hidden = decoder.reset_state(batch_size=1)
+
+    temp_input = tf.expand_dims(load_image(image)[0], 0)
+    img_tensor_val = image_features_extract_model(temp_input)
+    img_tensor_val = tf.reshape(img_tensor_val, (img_tensor_val.shape[0], -1, img_tensor_val.shape[3]))
+
+    features = encoder(img_tensor_val)
+
+    dec_input = tf.expand_dims([tokenizer.word_index['<start>']], 0)
+    result = []
+
+    for i in range(max_length):
+        predictions, hidden, attention_weights = decoder(dec_input, features, hidden)
+        ## 存储注意力权重以便后面制图
+        attention_plot[i] = tf.reshape(attention_weights, (-1, )).numpy()
+
+        predicted_id = tf.argmax(predictions[0]).numpy()
+        result.append(tokenizer.index_word[predicted_id])
+
+        if tokenizer.index_word[predicted_id] == '<end>':
+            return result, attention_plot
+        ## 预测的 ID 被输送回模型
+        dec_input = tf.expand_dims([predicted_id], 0)
+
+    attention_plot = attention_plot[:len(result), :]
+    return result, attention_plot
+
+
+def evaluate_vieo(vieo):
+    attention_plot = np.zeros((max_length, attention_features_shape))
+
+    hidden = decoder.reset_state(batch_size=1)
+
+    #temp_input = tf.expand_dims(load_image(image)[0], 0)
+    img_tensor_val = vieo
+    img_tensor_val = tf.reshape(img_tensor_val, (img_tensor_val.shape[0], -1, img_tensor_val.shape[3]))
+
+    features = encoder(img_tensor_val)
+
+    dec_input = tf.expand_dims([tokenizer.word_index['<start>']], 0)
+    result = []
+
+    for i in range(max_length):
+        predictions, hidden, attention_weights = decoder(dec_input, features, hidden)
+        ## 存储注意力权重以便后面制图
+        attention_plot[i] = tf.reshape(attention_weights, (-1, )).numpy()
+
+        predicted_id = tf.argmax(predictions[0]).numpy()
+        result.append(tokenizer.index_word[predicted_id])
+
+        if tokenizer.index_word[predicted_id] == '<end>':
+            return result, attention_plot
+        ## 预测的 ID 被输送回模型
+        dec_input = tf.expand_dims([predicted_id], 0)
+
+    attention_plot = attention_plot[:len(result), :]
+    return result, attention_plot
+
+
+## 注意力权重制图函数
+def plot_attention(image, result, attention_plot):
+    temp_image = np.array(Image.open(image))
+
+    fig = plt.figure(figsize=(10, 10))
+
+    len_result = len(result)
+    for l in range(len_result):
+        temp_att = np.resize(attention_plot[l], (8, 8))
+        ax = fig.add_subplot(len_result//2, len_result//2, l+1)
+        ax.set_title(result[l])
+        img = ax.imshow(temp_image)
+        ax.imshow(temp_att, cmap='gray', alpha=0.6, extent=img.get_extent())
+
+    plt.tight_layout()
+    plt.show()
+
+# captions on the validation set
+rid = np.random.randint(0, len(img_name_val))
+image = img_name_val[rid]
+real_caption = ' '.join([tokenizer.index_word[i] for i in cap_val[rid] if i not in [0]])
+result, attention_plot = evaluate(image)
+
+print ('Real Caption:', real_caption)
+print ('Prediction Caption:', ' '.join(result))
+bleu_v2_score = my_bleu_v2(' '.join(result), real_caption, 4, weights=[0.25, 0.25, 0.25, 0.25], mode=0)
+plot_attention(image, result, attention_plot)
+# opening the image
+Image.open(img_name_val[rid])
+
+#测试自己的图片
+image_url = './surf.jpg'
+image_extension = image_url[-4:]
+image_path = tf.keras.utils.get_file('image'+image_extension,
+                                     origin=image_url)
+
+result, attention_plot = evaluate(image_path)
+print ('Prediction Caption:', ' '.join(result))
+plot_attention(image_path, result, attention_plot)
+# opening the image
+Image.open(image_path)
